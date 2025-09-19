@@ -1,0 +1,30 @@
+[package]
+name = "digit_decompose"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fhe_processor = { path = "./fhe_processor_fixed" }
+tfhe = { version = "0.5.3", features = ["boolean", "shortint", "x86_64-unix"] }
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+aligned-vec = "0.5.0"
+dyn-stack = "0.9"
+thiserror = "1.0"  # For better error handling
+lazy_static = "1.5.0"
+concrete-fft = "0.4.0"
+itertools = "0.14.0"
+serde = { version = "1.0", features = ["derive"] }
+num-traits = "0.2.19"
+stats = "0.0.1"
+epoch = "0.0.2"
+jemalloc-ctl = "0.5"
+jemallocator = "0.5"
+rayon = "1"
+
+[dev-dependencies]
+criterion = { version = "0.4", features = ["html_reports"] }
+concrete-fft = { version = "0.4.0", features = ["serde"] }
+rayon = "1"
+jemalloc-ctl = "0.5"
+indicatif = "0.17"
