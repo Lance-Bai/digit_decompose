@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 fhe_processor = { path = "./fhe_processor_fixed" }
+refined-tfhe-lhe = { git = "https://github.com/KAIST-CryptLab/refined-tfhe-lhe.git", branch = "main" }
+
 tfhe = { version = "0.5.3", features = ["boolean", "shortint", "x86_64-unix"] }
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
