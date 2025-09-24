@@ -1,40 +1,30 @@
-use concrete_fft::c64;
-use fhe_processor::processors::pbs::pbs_many_lut_after_ms_before_extract;
-use refined_tfhe_lhe::{FourierGlweKeyswitchKey, generate_accumulator, mod_switch};
-use tfhe::{
-    boolean::{
-        ciphertext,
-        prelude::{DecompositionBaseLog, DecompositionLevelCount, LweDimension},
-    },
-    core_crypto::{
-        commons::math::decomposition::DecompositionLevel,
-        fft_impl::common::fast_pbs_modulus_switch,
-        prelude::{
-            CastFrom, CastInto, Cleartext, Container, ContainerMut, ContiguousEntityContainer,
-            ContiguousEntityContainerMut, FourierLweBootstrapKey, GlweCiphertext,
-            GlweCiphertextCount, GlweCiphertextList, LutCountLog, LweCiphertext, LweKeyswitchKey,
-            LweSize, ModulusSwitchOffset, MonomialDegree, UnsignedInteger, UnsignedTorus,
-            blind_rotate_assign, extract_lwe_sample_from_glwe_ciphertext,
-            glwe_ciphertext_cleartext_mul, glwe_ciphertext_cleartext_mul_assign,
-            glwe_ciphertext_sub, glwe_ciphertext_sub_assign, keyswitch_lwe_ciphertext,
-            lwe_ciphertext_cleartext_mul_assign, lwe_keyswitch,
-            multi_bit_programmable_bootstrap_lwe_ciphertext, programmable_bootstrap_lwe_ciphertext,
-        },
-    },
-    shortint::wopbs::CiphertextCount,
-};
-
 use crate::algorithms::{
-    pbs_many_lut::programmable_bootstrap_lwe_ciphertext_many_lut,
-    tools::{make_f1, make_f1_with_b},
+    pbs_many_lut::programmable_bootstrap_lwe_ciphertext_many_lut, tools::make_f1_with_b,
+};
+use concrete_fft::c64;
+use tfhe::core_crypto::prelude::{
+    decrypt_glwe_ciphertext, decrypt_lwe_ciphertext, glwe_ciphertext_plaintext_add_assign, plaintext_list, ModulusSwitchOffset, Plaintext, PlaintextList
+};
+use tfhe::shortint::wopbs::PlaintextCount;
+use tfhe::{
+    boolean::prelude::{DecompositionBaseLog, DecompositionLevelCount},
+    core_crypto::prelude::{
+        CastFrom, CastInto, Cleartext, Container, ContainerMut, ContiguousEntityContainer,
+        ContiguousEntityContainerMut, FourierLweBootstrapKey, GlweCiphertext, GlweCiphertextCount,
+        GlweCiphertextList, GlweSecretKey, LutCountLog, LweCiphertext, LweKeyswitchKey,
+        MonomialDegree, SignedDecomposer, UnsignedInteger, UnsignedTorus,
+        extract_lwe_sample_from_glwe_ciphertext, glwe_ciphertext_cleartext_mul,
+        glwe_ciphertext_sub_assign, keyswitch_lwe_ciphertext,
+    },
 };
 pub fn digit_decompose_no_padding<Scalar, InputCont, OutputCont, BskCont, KskCont>(
     input: &GlweCiphertext<InputCont>,
     output: &mut GlweCiphertextList<OutputCont>,
-    decompose_base_log: DecompositionBaseLog,
+    decompose_base_log: DecompositionBaseLog, //除去padding的位数,pbs用的是这个加一
     decompose_level: DecompositionLevelCount,
     fourier_bsk: &FourierLweBootstrapKey<BskCont>,
     ksk: &LweKeyswitchKey<KskCont>,
+    glwe_key: &GlweSecretKey<Vec<Scalar>>, // 需要提供 GlweSecretKey
 ) where
     Scalar: UnsignedTorus + CastInto<usize> + CastFrom<usize> + UnsignedInteger,
     InputCont: Container<Element = Scalar>,
@@ -53,11 +43,6 @@ pub fn digit_decompose_no_padding<Scalar, InputCont, OutputCont, BskCont, KskCon
     let after_ks_lwe_size = ksk.output_key_lwe_dimension().to_lwe_size();
     let glwe_size = fourier_bsk.glwe_size();
     let polynomial_size = fourier_bsk.polynomial_size();
-    let ciphertext_count = output.glwe_ciphertext_count().0;
-
-    let mut minuend =
-        GlweCiphertext::new(Scalar::ZERO, glwe_size, polynomial_size, ciphertext_modulus);
-    let mut subtrahend = minuend.clone();
 
     let mut extract_input = LweCiphertext::new(Scalar::ZERO, glwe_lwe_size, ciphertext_modulus);
     let mut after_ks = LweCiphertext::new(Scalar::ZERO, after_ks_lwe_size, ciphertext_modulus);
@@ -70,51 +55,81 @@ pub fn digit_decompose_no_padding<Scalar, InputCont, OutputCont, BskCont, KskCon
         ciphertext_modulus,
     );
 
-    //get m0
-    glwe_ciphertext_cleartext_mul(
-        &mut output.get_mut(0),
-        input,
-        Cleartext(Scalar::ONE << ((decompose_level.0 - 1) * decompose_base_log.0)),
-    );
+    let level = decompose_level.0; // 分解层数
+    let base_log = decompose_base_log.0; // base_log
+    let lut = vec![make_f1_with_b::<Scalar>(base_log)]; // PBS LUT，仅示例为单一 LUT
 
-    // get m1 * B + m0
-    glwe_ciphertext_cleartext_mul(
-        &mut output.get_mut(1),
-        input,
-        Cleartext(Scalar::ONE << ((decompose_level.0 - 2) * decompose_base_log.0)),
-    );
+    // ---- 1) 只初始化一次：先准备 output[0], output[1] ----
+    if level >= 1 {
+        glwe_ciphertext_cleartext_mul(
+            &mut output.get_mut(0),
+            input,
+            Cleartext(Scalar::ONE << ((level - 1) * base_log)),
+        );
+    }
+    if level >= 2 {
+        glwe_ciphertext_cleartext_mul(
+            &mut output.get_mut(1),
+            input,
+            Cleartext(Scalar::ONE << ((level - 2) * base_log)),
+        );
+    }
 
-    extract_lwe_sample_from_glwe_ciphertext(&output.get(0), &mut extract_input, MonomialDegree(0));
-    keyswitch_lwe_ciphertext(&ksk, &extract_input, &mut after_ks);
+    // ---- 2) 主循环：PBS 于 j，上一步结果减到 j+1（不同 j）----
+    for j in 0..level {
+        // 为下一步的“被减数”提前初始化 output[j+2]（若存在）
+        if j + 2 < level {
+            glwe_ciphertext_cleartext_mul(
+                &mut output.get_mut(j + 2),
+                input,
+                Cleartext(Scalar::ONE << ((level - 1 - (j + 2)) * base_log)),
+            );
+        }
 
-    programmable_bootstrap_lwe_ciphertext_many_lut(
-        &mut after_ks,
-        &mut pbs_result,
-        fourier_bsk,
-        LutCountLog(0),
-        decompose_base_log.0,
-        ciphertext_modulus,
-        vec![make_f1_with_b(decompose_base_log.0)],
-    );
+        // 从 output[j] 抽样 -> KS -> PBS
+        extract_lwe_sample_from_glwe_ciphertext(
+            &output.get(j),
+            &mut extract_input,
+            MonomialDegree(0),
+        );
 
-    glwe_ciphertext_sub_assign(&mut output.get_mut(0), &pbs_result.get(0));
+        // let tempp = decrypt_lwe_ciphertext(&glwe_key.as_lwe_secret_key(), &extract_input);
+        // let decomposer =
+        //     SignedDecomposer::<Scalar>::new(decompose_base_log, DecompositionLevelCount(1));
+        // let decode = decomposer.closest_representable(tempp.0);
+        // println!("before f1: {:064b}", decode);
 
-    glwe_ciphertext_cleartext_mul(
-        &mut output.get_mut(2),
-        &input,
-        Cleartext(Scalar::ONE << ((decompose_level.0 - 3) * decompose_base_log.0)),
-    );
+        keyswitch_lwe_ciphertext(&ksk, &extract_input, &mut after_ks);
+        programmable_bootstrap_lwe_ciphertext_many_lut(
+            &mut after_ks,
+            &mut pbs_result,
+            fourier_bsk,
+            LutCountLog(0),
+            base_log,
+            ciphertext_modulus,
+            &lut, 
+        );
+        // let decomposer =
+        //     SignedDecomposer::<Scalar>::new(DecompositionBaseLog(8), DecompositionLevelCount(1));
+        // let mut plain_list = PlaintextList::new(Scalar::ZERO, PlaintextCount(polynomial_size.0));
+        // decrypt_glwe_ciphertext(&glwe_key, &pbs_result.get(0), &mut plain_list);
+        // let decode = decomposer.closest_representable(*plain_list.get(0).0);
+        // println!("before add:\t{:064b}", decode);
+        glwe_ciphertext_plaintext_add_assign(
+            &mut pbs_result.get_mut(0),
+            Plaintext(Scalar::ONE << (Scalar::BITS -  base_log - 1)),
+        );
+        // println!("added:\t\t\t{:064b}", Scalar::ONE << (Scalar::BITS -  base_log - 2));
+        // let decomposer =
+        //     SignedDecomposer::<Scalar>::new(DecompositionBaseLog(8), DecompositionLevelCount(1));
+        // let mut plain_list = PlaintextList::new(Scalar::ZERO, PlaintextCount(polynomial_size.0));
+        // decrypt_glwe_ciphertext(&glwe_key, &pbs_result.get(0), &mut plain_list);
+        // let decode = decomposer.closest_representable(*plain_list.get(0).0);
+        // println!("to be sub:\t{:064b}", decode);
 
-    extract_lwe_sample_from_glwe_ciphertext(&output.get(1), &mut extract_input, MonomialDegree(0));
-    keyswitch_lwe_ciphertext(&ksk, &extract_input, &mut after_ks);
-    programmable_bootstrap_lwe_ciphertext_many_lut(
-        &mut after_ks,
-        &mut pbs_result,
-        fourier_bsk,
-        LutCountLog(0),
-        decompose_base_log.0,
-        ciphertext_modulus,
-        vec![make_f1_with_b(decompose_base_log.0)],
-    );
-    glwe_ciphertext_sub_assign(&mut output.get_mut(1), &pbs_result.get(0));
+        // 用 PBS 结果“减到下一段”：minuend = output[j+1], subtrahend = pbs_result[0]
+        if j + 1 < level {
+            glwe_ciphertext_sub_assign(&mut output.get_mut(j + 1), &pbs_result.get(0));
+        }
+    }
 }
