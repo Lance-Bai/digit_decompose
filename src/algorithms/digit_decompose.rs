@@ -7,10 +7,11 @@ use refined_tfhe_lhe::{
     FourierGlweKeyswitchKey, GlweKeyswitchKey, keyswitch_lwe_ciphertext_by_glwe_keyswitch,
 };
 use tfhe::boolean::prelude::LweDimension;
+use tfhe::core_crypto::prelude::polynomial_algorithms::{
+    polynomial_karatsuba_wrapping_mul, polynomial_wrapping_mul,
+};
 use tfhe::core_crypto::prelude::{
-    LweSize, ModulusSwitchOffset, Plaintext, PlaintextList, decrypt_glwe_ciphertext,
-    decrypt_lwe_ciphertext, glwe_ciphertext_plaintext_add_assign,
-    lwe_ciphertext_plaintext_add_assign, plaintext_list, programmable_bootstrap_lwe_ciphertext,
+    decrypt_glwe_ciphertext, decrypt_lwe_ciphertext, glwe_ciphertext_cleartext_mul_assign, glwe_ciphertext_plaintext_add_assign, glwe_ciphertext_plaintext_sub_assign, lwe_ciphertext_plaintext_add_assign, plaintext_list, programmable_bootstrap_lwe_ciphertext, LweSize, ModulusSwitchOffset, Plaintext, PlaintextList, Polynomial
 };
 use tfhe::shortint::wopbs::PlaintextCount;
 use tfhe::{
@@ -98,7 +99,7 @@ pub fn digit_decompose_no_padding<Scalar, InputCont, OutputCont, BskCont, KskCon
             &mut pbs_result,
             fourier_bsk,
             LutCountLog(0),
-            base_log-1,
+            base_log - 1,
             ciphertext_modulus,
             &lut,
         );
@@ -157,10 +158,8 @@ pub fn digit_decompose_with_padding<Scalar, InputCont, OutputCont, BskCont, KskC
     let level = decompose_level.0; // 分解层数
     let k = level - 1;
     let base_log = decompose_base_log.0; // base_log
-    let lut = vec![
-        make_f1_with_b::<Scalar>(base_log),
-        make_f3_with_b::<Scalar>(base_log),
-    ]; // PBS LUT，仅示例为单一 LUT
+    let lut = vec![make_f1_with_b::<Scalar>(base_log)];
+    let f3 = make_f3_with_b::<Scalar>(base_log);
 
     // ---- 1) 只初始化一次：先准备 output[0], output[1] ----
     let mut temp =
@@ -173,7 +172,7 @@ pub fn digit_decompose_with_padding<Scalar, InputCont, OutputCont, BskCont, KskC
         );
     }
     // ---- 2) 主循环：PBS 于 j，上一步结果减到 j+1（不同 j）----
-    for j in 0..k {
+    for j in 0..=k {
         // 从 output[j] 抽样 -> KS -> PBS
         extract_lwe_sample_from_glwe_ciphertext(&temp, &mut extract_input, MonomialDegree(0));
 
@@ -184,38 +183,78 @@ pub fn digit_decompose_with_padding<Scalar, InputCont, OutputCont, BskCont, KskC
         // println!("before f1: {:064b}", decode);
         keyswitch_lwe_ciphertext_by_glwe_keyswitch(&extract_input, &mut after_ks, &ksk);
 
-        lwe_ciphertext_plaintext_add_assign(
-            &mut after_ks,
-            Plaintext(Scalar::ONE << (Scalar::BITS - base_log - 1)),
-        );
+        // lwe_ciphertext_plaintext_add_assign(
+        //     &mut after_ks,
+        //     Plaintext(Scalar::ONE << (Scalar::BITS - base_log - 1)),
+        // );
         programmable_bootstrap_lwe_ciphertext_many_lut(
             &mut after_ks,
             &mut pbs_result,
             fourier_bsk,
-            LutCountLog(1),
-            base_log-1,
+            LutCountLog(0),
+            base_log - 1,
             ciphertext_modulus,
             &lut,
         );
 
-        let decomposer =
-            SignedDecomposer::<Scalar>::new(DecompositionBaseLog(8), DecompositionLevelCount(1));
-        let mut plain_list = PlaintextList::new(Scalar::ZERO, PlaintextCount(polynomial_size.0));
-        decrypt_glwe_ciphertext(&glwe_key, &pbs_result.get(1), &mut plain_list);
-        let decode = decomposer.closest_representable(*plain_list.get(0).0);
-        println!("output is:\t{:064b}", decode);
+        // let decomposer =
+        //     SignedDecomposer::<Scalar>::new(DecompositionBaseLog(8), DecompositionLevelCount(1));
+        // let mut plain_list = PlaintextList::new(Scalar::ZERO, PlaintextCount(polynomial_size.0));
+        // decrypt_glwe_ciphertext(&glwe_key, &pbs_result.get(1), &mut plain_list);
+        // let decode = decomposer.closest_representable(*plain_list.get(0).0);
+        // println!("output is:\t{:064b}", decode);
+
+        let box_size = polynomial_size.0 / (1_usize << (decompose_base_log.0 - 1));
+        let mut accumulator_scalar = vec![Scalar::ZERO; polynomial_size.0];
+        for (i, one_box) in accumulator_scalar.chunks_exact_mut(box_size).enumerate() {
+            let x = Scalar::cast_from(i);
+            // println!("\t{:032b} ", f3.call(x));
+            for a in one_box.iter_mut() {
+                *a = f3.call(x);
+            }
+        }
+        let mut temp_acc = accumulator_scalar.clone();
+        temp_acc.rotate_right(1);
+        let end_value = accumulator_scalar[0] + temp_acc[0];
+        for (a,b) in accumulator_scalar.iter_mut().zip(temp_acc.iter()){
+            *a = *a - *b;
+        }
+        accumulator_scalar[0] = end_value;
+
+        let prod = Polynomial::from_container(accumulator_scalar);
+
+        // let decomposer =
+        //     SignedDecomposer::<Scalar>::new(DecompositionBaseLog(16), DecompositionLevelCount(1));
+        // let mut plain_list = PlaintextList::new(Scalar::ZERO, PlaintextCount(polynomial_size.0));
+        // decrypt_glwe_ciphertext(&glwe_key, &pbs_result.get(0), &mut plain_list);
+        // let decode = decomposer.closest_representable(*plain_list.get(0).0);
+        // println!("before prod:\t{:064b}", decode);
+
+        let mut temp_output =
+            GlweCiphertext::new(Scalar::ZERO, glwe_size, polynomial_size, ciphertext_modulus);
+        for (mut result, input) in temp_output
+            .as_mut_polynomial_list()
+            .iter_mut()
+            .zip(pbs_result.get(0).as_polynomial_list().iter())
+        {
+            polynomial_wrapping_mul(&mut result, &input, &prod);
+        }
+        
+        // decrypt_glwe_ciphertext(&glwe_key, &temp_output, &mut plain_list);
+        // let decode = decomposer.closest_representable(*plain_list.get(0).0);
+        // println!("before add:\t{:064b}", decode);
 
         glwe_ciphertext_plaintext_add_assign(
-            &mut pbs_result.get_mut(1),
+            &mut temp_output,
             Plaintext(
                 (Scalar::ONE << (Scalar::BITS - base_log - 2))
                     * ((Scalar::ONE << base_log) - Scalar::ONE),
             ),
         );
-        println!("added:\t\t\t{:064b}", (Scalar::ONE << (Scalar::BITS - base_log - 2)) * ((Scalar::ONE << base_log) - Scalar::ONE));
+
+
         let mut dst = output.get_mut(j);
-        let src = pbs_result.get(1);
-        dst.as_mut().copy_from_slice(src.as_ref());
+        dst.as_mut().copy_from_slice(temp_output.as_ref());
 
         // let decomposer =
         //     SignedDecomposer::<Scalar>::new(DecompositionBaseLog(8), DecompositionLevelCount(1));
@@ -223,6 +262,9 @@ pub fn digit_decompose_with_padding<Scalar, InputCont, OutputCont, BskCont, KskC
         // decrypt_glwe_ciphertext(&glwe_key, &pbs_result.get(0), &mut plain_list);
         // let decode = decomposer.closest_representable(*plain_list.get(0).0);
         // println!("before add:\t{:064b}", decode);
+        if j == k {
+            break;
+        }
         glwe_ciphertext_plaintext_add_assign(
             &mut pbs_result.get_mut(0),
             Plaintext(Scalar::ONE << (Scalar::BITS - base_log - 1)),
@@ -235,7 +277,6 @@ pub fn digit_decompose_with_padding<Scalar, InputCont, OutputCont, BskCont, KskC
         // let decode = decomposer.closest_representable(*plain_list.get(0).0);
         // println!("to be sub:\t{:064b}", decode);
 
-        // 为下一步的“被减数”提前初始化 output[j+2]（若存在）
         glwe_ciphertext_cleartext_mul(
             &mut temp,
             input,

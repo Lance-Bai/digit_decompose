@@ -247,7 +247,6 @@ fn main() {
     let fft = Fft::new(cbs_polynomial_size);
     for num in (0_usize..4096).step_by(7) {
         // println!("num:\t\t\t\t{:012b}", num);
-        let num = 0_usize;
         print!("num: {:012b} ", num);
         let mut plain_list =
             PlaintextList::from_container(vec![(num as u64) << 48; polynomial_size.0]);
@@ -277,15 +276,15 @@ fn main() {
         //     &ksk_lwe,
         //     &glwe_key,
         // );
-        digit_decompose_no_padding(
-            &input,
-            &mut output,
-            decompose_base_log,
-            decompose_level,
-            &fourier_bsk,
-            &fourier_ksk,
-            &glwe_key,
-        );
+        // digit_decompose_no_padding(
+        //     &input,
+        //     &mut output,
+        //     decompose_base_log,
+        //     decompose_level,
+        //     &fourier_bsk,
+        //     &fourier_ksk,
+        //     &glwe_key,
+        // );
 
         // for (i,mut e) in output.iter_mut().enumerate() {
         //     // decrypt_glwe_ciphertext(&glwe_key, &e, &mut plain_list);
@@ -303,15 +302,15 @@ fn main() {
         //     );
         // }
 
-        // digit_decompose_with_padding(
-        //     &input,
-        //     &mut output,
-        //     decompose_base_log,
-        //     decompose_level,
-        //     &fourier_bsk,
-        //     &fourier_ksk,
-        //     &glwe_key,
-        // );
+        digit_decompose_with_padding(
+            &input,
+            &mut output,
+            decompose_base_log,
+            decompose_level,
+            &fourier_bsk,
+            &fourier_ksk,
+            &glwe_key,
+        );
         let mut fourier_ggsw_lists = vec![fourier_ggsw_list.clone(); decompose_level.0];
 
         for (i, mut e) in output.iter().zip(fourier_ggsw_lists.iter_mut()) {
@@ -336,14 +335,14 @@ fn main() {
             &mut computation_buffer,
         );
         let decomposer = SignedDecomposer::<u64>::new(
-            DecompositionBaseLog(decompose_base_log.0),
+            DecompositionBaseLog(decompose_base_log.0 + 2),
             DecompositionLevelCount(1),
         );
         print!("  result:");
         for e in output.iter().rev() {
             decrypt_glwe_ciphertext(&glwe_key, &e, &mut plain_list);
             let decode = decomposer.closest_representable(*plain_list.get(0).0);
-            print!(" {:04b}", decode >> 60);
+            print!(" {:06b}", decode >> 58);
         }
         print!("  final:");
         for e in final_lwes.iter() {

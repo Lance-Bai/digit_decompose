@@ -62,7 +62,7 @@ impl LutFn {
                 Scalar::ONE.wrapping_neg() << Scalar::BITS - self.b - 2
             }
             LutKind::F3 => {
-                (Scalar::TWO * x + Scalar::ONE).wrapping_neg() << (Scalar::BITS - self.b - 2)
+                (Scalar::TWO * x + Scalar::ONE).wrapping_neg()
             }
         }
     }
