@@ -7,8 +7,7 @@ use std::{
 use concrete_fft::c64;
 use fhe_processor::{
     operations::{
-        cipher_lut::generate_lut_from_vecs_auto,
-        manager::concat_ggsw_lists,
+        cipher_lut::generate_lut_from_vecs_auto, manager::concat_ggsw_lists,
         operation::horizontal_vertical_packing_without_extract,
         plain_lut::split_adjusted_lut_by_chunk,
     },
@@ -16,14 +15,19 @@ use fhe_processor::{
         cbs_4_bits::circuit_bootstrapping_4_bits_at_once_rev_tr,
         key_gen::allocate_and_generate_new_reused_lwe_key,
         lwe_stored_ksk::allocate_and_generate_new_stored_reused_lwe_keyswitch_key,
+        lwe_storede_ks::stored_reused_keyswitch_lwe_ciphertext,
     },
     utils::instance::SetI,
 };
+use itertools::izip;
 use refined_tfhe_lhe::{
     FourierGlweKeyswitchKey, allocate_and_generate_new_glwe_keyswitch_key, gen_all_auto_keys,
     generate_scheme_switching_key,
 };
-use tfhe::core_crypto::fft_impl::fft64::crypto::wop_pbs::vertical_packing_scratch;
+use tfhe::core_crypto::{
+    fft_impl::fft64::crypto::wop_pbs::vertical_packing_scratch,
+    prelude::programmable_bootstrap_lwe_ciphertext,
+};
 
 use tfhe::{
     boolean::prelude::{
@@ -41,8 +45,7 @@ use tfhe::{
             allocate_and_generate_new_binary_lwe_secret_key,
             allocate_and_generate_new_lwe_bootstrap_key,
             convert_standard_lwe_bootstrap_key_to_fourier, encrypt_glwe_ciphertext,
-            extract_lwe_sample_from_glwe_ciphertext,
-            glwe_ciphertext_cleartext_mul_assign,
+            extract_lwe_sample_from_glwe_ciphertext, glwe_ciphertext_cleartext_mul_assign,
             par_allocate_and_generate_new_lwe_bootstrap_key,
             par_convert_standard_lwe_bootstrap_key_to_fourier,
         },
@@ -61,6 +64,20 @@ fn main() {
         DecompositionLevelCount(3),
         DecompositionLevelCount(4),
         DecompositionLevelCount(5),
+    ];
+    let combine_levels = vec![
+        DecompositionLevelCount(1),
+        DecompositionLevelCount(1),
+        DecompositionLevelCount(2),
+        DecompositionLevelCount(3),
+        DecompositionLevelCount(4),
+    ];
+    let combine_base_logs = vec![
+        DecompositionBaseLog(24),
+        DecompositionBaseLog(24),
+        DecompositionBaseLog(16),
+        DecompositionBaseLog(12),
+        DecompositionBaseLog(10),
     ];
     let decompose_base_log = DecompositionBaseLog(4);
     let mut boxed_seeder = new_seeder();
@@ -231,10 +248,42 @@ fn main() {
         ciphertext_modulus,
     );
 
-    for decompose_level in decompose_levels.iter() {
+    for (decompose_level, combine_level, combine_base_log) in izip!(
+        decompose_levels.iter(),
+        combine_levels.iter(),
+        combine_base_logs.iter()
+    ) {
+        let combine_bsk = allocate_and_generate_new_lwe_bootstrap_key(
+            &lwe_key,
+            &cbs_glwe_key,
+            *combine_base_log,
+            *combine_level,
+            cbs_glwe_modular_std_dev,
+            ciphertext_modulus,
+            &mut encryption_generator,
+        );
+        let fourier_combine_bsk = {
+            let mut tmp = FourierLweBootstrapKey::new(
+                combine_bsk.input_lwe_dimension(),
+                combine_bsk.glwe_size(),
+                combine_bsk.polynomial_size(),
+                combine_bsk.decomposition_base_log(),
+                combine_bsk.decomposition_level_count(),
+            );
+            convert_standard_lwe_bootstrap_key_to_fourier(&combine_bsk, &mut tmp);
+            drop(combine_bsk);
+            tmp
+        };
         let mut final_lwes = vec![extract_input.clone(); decompose_level.0];
+        let mut middle_lwe =
+            LweCiphertext::new(0_u64, cbs_lwe_dimension.to_lwe_size(), ciphertext_modulus);
+        let mut final_lwe =extract_input.clone();
+        let combine_lut =
+            GlweCiphertext::new(0u64, cbs_glwe_size, cbs_polynomial_size, ciphertext_modulus);
         let mut decompose_time = Duration::ZERO;
         let mut lut_time = Duration::ZERO;
+        let mut group_time = Duration::ZERO;
+        let mut total_time = Duration::ZERO;
 
         for num in 0_usize..100 {
             // println!("num:\t\t\t\t{:012b}", num);
@@ -381,6 +430,19 @@ fn main() {
             let duration = start.elapsed();
             lut_time.add_assign(duration);
 
+            let start = Instant::now();
+            for elem in final_lwes.iter_mut() {
+                stored_reused_keyswitch_lwe_ciphertext(&cbs_ksk, &elem, &mut middle_lwe);
+                programmable_bootstrap_lwe_ciphertext(
+                    &middle_lwe,
+                    &mut final_lwe,
+                    &combine_lut,
+                    &fourier_combine_bsk,
+                );
+            }
+            let duration = start.elapsed();
+            group_time.add_assign(duration);
+            
             // let decomposer = SignedDecomposer::<u64>::new(
             //     DecompositionBaseLog(decompose_base_log.0 + 2),
             //     DecompositionLevelCount(1),
@@ -399,11 +461,14 @@ fn main() {
             // }
             // println!()
         }
+        total_time = decompose_time + lut_time + group_time;
         println!(
-            "level:{}, decompose_time:{:?}, lut_time:{:?}",
+            "level:{}, decompose_time:{:?}, lut_time:{:?}, group_time:{:?}, total_time:{:?}",
             decompose_level.0,
             decompose_time / 100,
-            lut_time / 100
+            lut_time / 100,
+            group_time / 100,
+            total_time / 100
         );
     }
 }
