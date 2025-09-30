@@ -20,6 +20,10 @@ use fhe_processor::{
     utils::instance::SetI,
 };
 use itertools::izip;
+use rayon::{
+    iter::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator},
+    slice::ParallelSliceMut,
+};
 use refined_tfhe_lhe::{
     FourierGlweKeyswitchKey, allocate_and_generate_new_glwe_keyswitch_key, gen_all_auto_keys,
     generate_scheme_switching_key,
@@ -277,7 +281,7 @@ fn main() {
         let mut final_lwes = vec![extract_input.clone(); decompose_level.0];
         let mut middle_lwe =
             LweCiphertext::new(0_u64, cbs_lwe_dimension.to_lwe_size(), ciphertext_modulus);
-        let mut final_lwe =extract_input.clone();
+        let mut final_lwe = extract_input.clone();
         let combine_lut =
             GlweCiphertext::new(0u64, cbs_glwe_size, cbs_polynomial_size, ciphertext_modulus);
         let mut decompose_time = Duration::ZERO;
@@ -365,18 +369,34 @@ fn main() {
                 glwe_ciphertext_cleartext_mul_assign(&mut e, Cleartext(2_u64));
             }
 
-            for (i, mut e) in output.iter().zip(fourier_ggsw_lists.iter_mut()) {
-                extract_lwe_sample_from_glwe_ciphertext(&i, &mut extract_input, MonomialDegree(0));
-                circuit_bootstrapping_4_bits_at_once_rev_tr(
-                    &mut extract_input,
-                    &mut e,
-                    cbs_fourier_bsk.as_view(),
-                    &auto_keys,
-                    ss_key.as_view(),
-                    &cbs_ksk,
-                    &cbs_params,
-                );
-            }
+            // for (i, mut e) in output.iter().zip(fourier_ggsw_lists.iter_mut()) {
+            //     extract_lwe_sample_from_glwe_ciphertext(&i, &mut extract_input, MonomialDegree(0));
+            //     circuit_bootstrapping_4_bits_at_once_rev_tr(
+            //         &mut extract_input,
+            //         &mut e,
+            //         cbs_fourier_bsk.as_view(),
+            //         &auto_keys,
+            //         ss_key.as_view(),
+            //         &cbs_ksk,
+            //         &cbs_params,
+            //     );
+            // }
+            fourier_ggsw_lists
+                .par_iter_mut()
+                .enumerate().zip(output.par_iter())
+                .for_each(|((i, ggsw), e)| {
+                    let mut temp_buffer = extract_input.clone();
+                    extract_lwe_sample_from_glwe_ciphertext(&e, &mut temp_buffer, MonomialDegree(0));
+                    circuit_bootstrapping_4_bits_at_once_rev_tr(
+                        &temp_buffer,
+                        ggsw,
+                        cbs_fourier_bsk.as_view(),
+                        &auto_keys,
+                        ss_key.as_view(),
+                        &cbs_ksk,
+                        &cbs_params,
+                    );
+                });
             fourier_ggsw_lists.reverse();
             let ggsw_bits = concat_ggsw_lists(fourier_ggsw_lists, true);
 
@@ -396,8 +416,8 @@ fn main() {
             let binding = Fft::new(cbs_polynomial_size);
             let fft_view = binding.as_view();
             all_lut
-                .iter()
-                .zip(final_lwes.chunks_mut(group_size))
+                .par_iter()
+                .zip(final_lwes.par_chunks_mut(group_size))
                 .for_each(|(lut, lwe_group)| {
                     let mut local_buffer = ComputationBuffers::new();
                     let need = vertical_packing_scratch::<u64>(
@@ -442,7 +462,7 @@ fn main() {
             }
             let duration = start.elapsed();
             group_time.add_assign(duration);
-            
+
             // let decomposer = SignedDecomposer::<u64>::new(
             //     DecompositionBaseLog(decompose_base_log.0 + 2),
             //     DecompositionLevelCount(1),
