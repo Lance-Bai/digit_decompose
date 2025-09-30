@@ -1,10 +1,19 @@
-use std::vec;
+use std::{
+    ops::AddAssign,
+    time::{Duration, Instant},
+    vec,
+};
 
 use concrete_fft::c64;
 use fhe_processor::{
-    operations::{manager::concat_ggsw_lists, operation::Operation},
+    operations::{
+        cipher_lut::generate_lut_from_vecs_auto,
+        manager::concat_ggsw_lists,
+        operation::horizontal_vertical_packing_without_extract,
+        plain_lut::split_adjusted_lut_by_chunk,
+    },
     processors::{
-        cbs_4_bits::{self, circuit_bootstrapping_4_bits_at_once_rev_tr},
+        cbs_4_bits::circuit_bootstrapping_4_bits_at_once_rev_tr,
         key_gen::allocate_and_generate_new_reused_lwe_key,
         lwe_stored_ksk::allocate_and_generate_new_stored_reused_lwe_keyswitch_key,
     },
@@ -12,21 +21,18 @@ use fhe_processor::{
 };
 use refined_tfhe_lhe::{
     FourierGlweKeyswitchKey, allocate_and_generate_new_glwe_keyswitch_key, gen_all_auto_keys,
-    generate_accumulator, generate_scheme_switching_key,
-    keyswitch_lwe_ciphertext_by_glwe_keyswitch,
+    generate_scheme_switching_key,
 };
+use tfhe::core_crypto::fft_impl::fft64::crypto::wop_pbs::vertical_packing_scratch;
+
 use tfhe::{
     boolean::prelude::{
         DecompositionBaseLog, DecompositionLevelCount, GlweDimension, LweDimension, PolynomialSize,
         StandardDev,
     },
     core_crypto::{
-        commons::{
-            computation_buffers,
-            math::{decomposition::DecompositionLevel, random::Gaussian},
-        },
         prelude::{
-            ActivatedRandomGenerator, CiphertextModulus, ComputationBuffers,
+            ActivatedRandomGenerator, CiphertextModulus, Cleartext, ComputationBuffers,
             ContiguousEntityContainer, ContiguousEntityContainerMut, EncryptionRandomGenerator,
             Fft, FourierGgswCiphertextList, FourierLweBootstrapKey, GlweCiphertext,
             GlweCiphertextCount, GlweCiphertextList, GlweSecretKey, GlweSize, LweCiphertext,
@@ -34,13 +40,11 @@ use tfhe::{
             allocate_and_generate_new_binary_glwe_secret_key,
             allocate_and_generate_new_binary_lwe_secret_key,
             allocate_and_generate_new_lwe_bootstrap_key,
-            allocate_and_generate_new_lwe_keyswitch_key,
-            convert_standard_lwe_bootstrap_key_to_fourier, decrypt_glwe_ciphertext,
-            decrypt_glwe_ciphertext_list, decrypt_lwe_ciphertext, encrypt_glwe_ciphertext,
-            encrypt_glwe_ciphertext_assign, extract_lwe_sample_from_glwe_ciphertext,
+            convert_standard_lwe_bootstrap_key_to_fourier, encrypt_glwe_ciphertext,
+            extract_lwe_sample_from_glwe_ciphertext,
+            glwe_ciphertext_cleartext_mul_assign,
             par_allocate_and_generate_new_lwe_bootstrap_key,
-            par_convert_standard_lwe_bootstrap_key_to_fourier, polynomial,
-            programmable_bootstrap_lwe_ciphertext,
+            par_convert_standard_lwe_bootstrap_key_to_fourier,
         },
         seeders::new_seeder,
     },
@@ -51,14 +55,20 @@ use crate::algorithms::digit_decompose::*;
 mod algorithms;
 fn main() {
     println!("Hello, world!");
+    let decompose_levels = vec![
+        DecompositionLevelCount(1),
+        DecompositionLevelCount(2),
+        DecompositionLevelCount(3),
+        DecompositionLevelCount(4),
+        DecompositionLevelCount(5),
+    ];
+    let decompose_base_log = DecompositionBaseLog(4);
     let mut boxed_seeder = new_seeder();
     let seeder = boxed_seeder.as_mut();
     let pbs_level = DecompositionLevelCount(1);
     let pbs_base_log = DecompositionBaseLog(26);
     let ks_level = DecompositionLevelCount(6);
     let ks_base_log = DecompositionBaseLog(4);
-    let decompose_level = DecompositionLevelCount(4);
-    let decompose_base_log = DecompositionBaseLog(4);
     let glwe_dimension = GlweDimension(1);
     let polynomial_size = PolynomialSize(2048);
     let lwe_dimension = LweDimension(1024);
@@ -82,16 +92,6 @@ fn main() {
 
     let lwe_glwe_key = GlweSecretKey::from_container(lwe_key.as_ref(), PolynomialSize(1024));
     let glwe_glwe_key = GlweSecretKey::from_container(glwe_key.as_ref(), PolynomialSize(1024));
-
-    let ksk_lwe = allocate_and_generate_new_lwe_keyswitch_key(
-        &glwe_key.as_lwe_secret_key(),
-        &lwe_key,
-        ks_base_log,
-        ks_level,
-        lwe_std_dev,
-        ciphertext_modulus,
-        &mut encryption_generator,
-    );
 
     let ksk = allocate_and_generate_new_glwe_keyswitch_key(
         &glwe_glwe_key,
@@ -164,7 +164,7 @@ fn main() {
         &lwe_sk_after_ks,
         cbs_ks_base_log,
         cbs_ks_level,
-        cbs_glwe_modular_std_dev,
+        cbs_lwe_modular_std_dev,
         cbs_ciphertext_modulus,
         &mut encryption_generator,
     );
@@ -231,125 +231,179 @@ fn main() {
         ciphertext_modulus,
     );
 
-    let operation = Operation::new(
-        fhe_processor::operations::operand::ArithmeticOp::Mul,
-        fhe_processor::operations::operation::OperandType::CipherPlain,
-        decompose_base_log.0 * decompose_level.0,
-        decompose_base_log.0,
-        cbs_polynomial_size,
-        1_u64 << (64 - decompose_base_log.0),
-        Some(2),
-    );
+    for decompose_level in decompose_levels.iter() {
+        let mut final_lwes = vec![extract_input.clone(); decompose_level.0];
+        let mut decompose_time = Duration::ZERO;
+        let mut lut_time = Duration::ZERO;
 
-    let mut final_lwes = vec![extract_input.clone(); 4];
+        for num in 0_usize..100 {
+            // println!("num:\t\t\t\t{:012b}", num);
+            // print!("num: {:012b} ", num);
+            let plain_list = PlaintextList::from_container(vec![
+                (num as u64)
+                    << 64
+                        - decompose_base_log.0
+                            * decompose_level.0;
+                polynomial_size.0
+            ]);
 
-    let mut computation_buffer = ComputationBuffers::new();
-    let fft = Fft::new(cbs_polynomial_size);
-    for num in (0_usize..4096).step_by(7) {
-        // println!("num:\t\t\t\t{:012b}", num);
-        print!("num: {:012b} ", num);
-        let mut plain_list =
-            PlaintextList::from_container(vec![(num as u64) << 48; polynomial_size.0]);
-
-        encrypt_glwe_ciphertext(
-            &glwe_key,
-            &mut input,
-            &plain_list,
-            glwe_std_dev,
-            &mut encryption_generator,
-        );
-
-        let mut output = GlweCiphertextList::new(
-            0u64,
-            glwe_dimension.to_glwe_size(),
-            polynomial_size,
-            GlweCiphertextCount(decompose_level.0),
-            ciphertext_modulus,
-        );
-
-        // digit_decompose_no_padding_ori(
-        //     &input,
-        //     &mut output,
-        //     decompose_base_log,
-        //     decompose_level,
-        //     &fourier_bsk,
-        //     &ksk_lwe,
-        //     &glwe_key,
-        // );
-        // digit_decompose_no_padding(
-        //     &input,
-        //     &mut output,
-        //     decompose_base_log,
-        //     decompose_level,
-        //     &fourier_bsk,
-        //     &fourier_ksk,
-        //     &glwe_key,
-        // );
-
-        // for (i,mut e) in output.iter_mut().enumerate() {
-        //     // decrypt_glwe_ciphertext(&glwe_key, &e, &mut plain_list);
-        //     // let decode = decomposer.closest_representable(*plain_list.get(0).0);
-        //     // print!(" {:04b}", decode >> 60);
-        //     let p = num >> (i * 4) & 0b1111;
-        //     let local_plain =
-        //     PlaintextList::from_container(vec![(p as u64) << 60; polynomial_size.0]);
-        //     encrypt_glwe_ciphertext(
-        //         &glwe_key,
-        //         &mut e,
-        //         &local_plain,
-        //         glwe_std_dev,
-        //         &mut encryption_generator,
-        //     );
-        // }
-
-        digit_decompose_with_padding(
-            &input,
-            &mut output,
-            decompose_base_log,
-            decompose_level,
-            &fourier_bsk,
-            &fourier_ksk,
-            &glwe_key,
-        );
-        let mut fourier_ggsw_lists = vec![fourier_ggsw_list.clone(); decompose_level.0];
-
-        for (i, mut e) in output.iter().zip(fourier_ggsw_lists.iter_mut()) {
-            extract_lwe_sample_from_glwe_ciphertext(&i, &mut extract_input, MonomialDegree(0));
-            circuit_bootstrapping_4_bits_at_once_rev_tr(
-                &mut extract_input,
-                &mut e,
-                cbs_fourier_bsk.as_view(),
-                &auto_keys,
-                ss_key.as_view(),
-                &cbs_ksk,
-                &cbs_params,
+            encrypt_glwe_ciphertext(
+                &glwe_key,
+                &mut input,
+                &plain_list,
+                glwe_std_dev,
+                &mut encryption_generator,
             );
-        }
-        fourier_ggsw_lists.reverse();
-        let ggsw_bits = concat_ggsw_lists(fourier_ggsw_lists, true);
 
-        operation.vertical_packing_multi_lookup(
-            &mut final_lwes,
-            &ggsw_bits,
-            &fft,
-            &mut computation_buffer,
-        );
-        let decomposer = SignedDecomposer::<u64>::new(
-            DecompositionBaseLog(decompose_base_log.0 + 2),
-            DecompositionLevelCount(1),
-        );
-        print!("  result:");
-        for e in output.iter().rev() {
-            decrypt_glwe_ciphertext(&glwe_key, &e, &mut plain_list);
-            let decode = decomposer.closest_representable(*plain_list.get(0).0);
-            print!(" {:06b}", decode >> 58);
+            let mut output = GlweCiphertextList::new(
+                0u64,
+                glwe_dimension.to_glwe_size(),
+                polynomial_size,
+                GlweCiphertextCount(decompose_level.0),
+                ciphertext_modulus,
+            );
+
+            let mut fourier_ggsw_lists = vec![fourier_ggsw_list.clone(); decompose_level.0];
+
+            // digit_decompose_no_padding_ori(
+            //     &input,
+            //     &mut output,
+            //     decompose_base_log,
+            //     decompose_level,
+            //     &fourier_bsk,
+            //     &ksk_lwe,
+            //     &glwe_key,
+            // );
+            // digit_decompose_no_padding(
+            //     &input,
+            //     &mut output,
+            //     decompose_base_log,
+            //     decompose_level,
+            //     &fourier_bsk,
+            //     &fourier_ksk,
+            //     &glwe_key,
+            // );
+
+            // for (i,mut e) in output.iter_mut().enumerate() {
+            //     // decrypt_glwe_ciphertext(&glwe_key, &e, &mut plain_list);
+            //     // let decode = decomposer.closest_representable(*plain_list.get(0).0);
+            //     // print!(" {:04b}", decode >> 60);
+            //     let p = num >> (i * 4) & 0b1111;
+            //     let local_plain =
+            //     PlaintextList::from_container(vec![(p as u64) << 60; polynomial_size.0]);
+            //     encrypt_glwe_ciphertext(
+            //         &glwe_key,
+            //         &mut e,
+            //         &local_plain,
+            //         glwe_std_dev,
+            //         &mut encryption_generator,
+            //     );
+            // }
+            let start = Instant::now();
+            digit_decompose_with_padding(
+                &input,
+                &mut output,
+                decompose_base_log,
+                *decompose_level,
+                &fourier_bsk,
+                &fourier_ksk,
+                &glwe_key,
+            );
+            let duration = start.elapsed();
+            decompose_time.add_assign(duration);
+            let start = Instant::now();
+            for mut e in output.iter_mut() {
+                glwe_ciphertext_cleartext_mul_assign(&mut e, Cleartext(2_u64));
+            }
+
+            for (i, mut e) in output.iter().zip(fourier_ggsw_lists.iter_mut()) {
+                extract_lwe_sample_from_glwe_ciphertext(&i, &mut extract_input, MonomialDegree(0));
+                circuit_bootstrapping_4_bits_at_once_rev_tr(
+                    &mut extract_input,
+                    &mut e,
+                    cbs_fourier_bsk.as_view(),
+                    &auto_keys,
+                    ss_key.as_view(),
+                    &cbs_ksk,
+                    &cbs_params,
+                );
+            }
+            fourier_ggsw_lists.reverse();
+            let ggsw_bits = concat_ggsw_lists(fourier_ggsw_lists, true);
+
+            // a trival lut, just ues it size
+            let n_bits = decompose_base_log.0 * decompose_level.0;
+            let plain_lut = vec![0usize; 1 << n_bits];
+            let split_plain_lut =
+                split_adjusted_lut_by_chunk(&plain_lut, n_bits, decompose_base_log.0);
+            let (all_lut, pack_size) = generate_lut_from_vecs_auto(
+                &split_plain_lut,
+                cbs_polynomial_size,
+                1 << (u64::BITS as usize - cbs_message_size),
+            );
+            let ggsw_view = ggsw_bits.as_view();
+            let group_size = pack_size.min(n_bits / 4);
+            let lut_size = 1_usize << n_bits;
+            let binding = Fft::new(cbs_polynomial_size);
+            let fft_view = binding.as_view();
+            all_lut
+                .iter()
+                .zip(final_lwes.chunks_mut(group_size))
+                .for_each(|(lut, lwe_group)| {
+                    let mut local_buffer = ComputationBuffers::new();
+                    let need = vertical_packing_scratch::<u64>(
+                        ggsw_view.glwe_size(),
+                        ggsw_view.polynomial_size(),
+                        lut.polynomial_count(),
+                        ggsw_view.count(),
+                        fft_view,
+                    )
+                    .unwrap()
+                    .unaligned_bytes_required();
+                    local_buffer.resize(need);
+
+                    let stack = local_buffer.stack();
+                    let temp = horizontal_vertical_packing_without_extract(
+                        lut.as_view(),
+                        ggsw_view,
+                        fft_view,
+                        stack,
+                        lwe_group[0].ciphertext_modulus(),
+                    );
+                    for (i, lwe) in lwe_group.iter_mut().enumerate() {
+                        extract_lwe_sample_from_glwe_ciphertext(
+                            &temp,
+                            lwe,
+                            MonomialDegree(i * lut_size),
+                        );
+                    }
+                });
+            let duration = start.elapsed();
+            lut_time.add_assign(duration);
+
+            // let decomposer = SignedDecomposer::<u64>::new(
+            //     DecompositionBaseLog(decompose_base_log.0 + 2),
+            //     DecompositionLevelCount(1),
+            // );
+            // print!("  result:");
+            // for e in output.iter().rev() {
+            //     decrypt_glwe_ciphertext(&glwe_key, &e, &mut plain_list);
+            //     let decode = decomposer.closest_representable(*plain_list.get(0).0);
+            //     print!(" {:06b}", decode >> 58);
+            // }
+            // print!("  final:");
+            // for e in final_lwes.iter() {
+            //     let result = decrypt_lwe_ciphertext(&cbs_glwe_key.as_lwe_secret_key(), &e);
+            //     let decode = decomposer.closest_representable(result.0);
+            //     print!(" {:04b}", decode >> 60);
+            // }
+            // println!()
         }
-        print!("  final:");
-        for e in final_lwes.iter() {
-            let result = decrypt_lwe_ciphertext(&cbs_glwe_key.as_lwe_secret_key(), &e);
-            let decode = decomposer.closest_representable(result.0);
-            print!(" {:04b}", decode >> 60);
-        }
-        println!()
+        println!(
+            "level:{}, decompose_time:{:?}, lut_time:{:?}",
+            decompose_level.0,
+            decompose_time / 100,
+            lut_time / 100
+        );
     }
 }
